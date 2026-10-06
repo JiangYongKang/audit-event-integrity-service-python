@@ -104,7 +104,7 @@ class TestIntegrity:
         service.ingest_batch([make_event(f"e{i}", sequence=i)
                               for i in range(1, 3)])
         original = service.store.get_event("e1")
-        service.store._events["e1"] = type(original)(  # noqa: SLF001
+        service.store._events["e1"] = type(original)(
             **{**original.__dict__, "payload": {"forged": True}})
         result = service.verify_source("s1")
         logger.info("篡改后校验: %s (%s)", result.status, result.message)

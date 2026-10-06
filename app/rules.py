@@ -191,7 +191,7 @@ class RuleEngine:
                     event_id=event.event_id,
                     outcome=RuleOutcome.MATCH if matched else RuleOutcome.NO_MATCH,
                     rationale=rationale, matched=matched))
-            except Exception as exc:  # 异常隔离：单规则失败不影响整批
+            except Exception as exc:  # noqa: BLE001 异常隔离：单规则失败不影响整批
                 results.append(RuleResult(
                     rule_id=rule_id, rule_version=definition.version,
                     event_id=event.event_id, outcome=RuleOutcome.ERROR,

@@ -9,6 +9,8 @@ from __future__ import annotations
 import threading
 import time
 
+from app.archive import DEFAULT_MAX_RECORDS, RejectionArchive
+from app.errors import ArchiveFullError
 from app.integrity import IntegrityChain
 from app.models import (
     AuditEvent,
@@ -17,6 +19,7 @@ from app.models import (
     EventEvaluation,
     IngestResult,
     IngestStatus,
+    RejectionRecord,
     RejectReason,
     VerificationResult,
 )
@@ -31,12 +34,14 @@ def _now_ms() -> int:
 
 
 class AuditService:
-    def __init__(self, retention: RetentionConfig | None = None) -> None:
+    def __init__(self, retention: RetentionConfig | None = None,
+                 archive_capacity: int = DEFAULT_MAX_RECORDS) -> None:
         self.store = EventStore()
         self.validator = EventValidator(self.store)
         self.chain = IntegrityChain()
         self.rules = RuleEngine()
         self.retention = retention
+        self.archive = RejectionArchive(max_records=archive_capacity)
         self._ingest_lock = threading.Lock()
         # 每个来源已接收的最大序号（来源内序号单调约束）
         self._last_sequence: dict[str, int] = {}
@@ -45,20 +50,46 @@ class AuditService:
     def ingest_batch(
         self, events: list[dict], declared_source: str | None = None
     ) -> list[IngestResult]:
-        return [self._ingest_one(raw, declared_source) for raw in events]
+        return [self._ingest_one(raw, declared_source, channel="ingest")
+                for raw in events]
 
-    def _ingest_one(self, raw: dict, declared_source: str | None) -> IngestResult:
+    def _ingest_one(self, raw: dict, declared_source: str | None,
+                    channel: str) -> IngestResult:
         event, rejection = self.validator.normalize_and_validate(raw, declared_source)
         if rejection is not None:
             reason, detail = rejection
-            return IngestResult(
+            result = IngestResult(
                 status=IngestStatus.REJECTED,
                 event_id=raw.get("event_id") if isinstance(raw, dict) else None,
                 source=raw.get("source") if isinstance(raw, dict) else None,
                 reason=reason, detail=detail)
+            return self._archive_rejection(result, raw, channel)
         assert event is not None
         with self._ingest_lock:
-            return self._accept_or_reject(event)
+            result = self._accept_or_reject(event)
+        if result.status == IngestStatus.REJECTED:
+            result = self._archive_rejection(result, raw, channel)
+        return result
+
+    def _archive_rejection(self, result: IngestResult, raw: dict,
+                           channel: str) -> IngestResult:
+        """把被拒投递写入留档；留档写满时以可区分原因背压。"""
+        try:
+            self.archive.record(
+                event_id=result.event_id, source=result.source,
+                reason=result.reason, detail=result.detail or "",
+                raw=raw if isinstance(raw, dict) else {"_raw": raw},
+                channel=channel, now_ms=_now_ms())
+            return result
+        except ArchiveFullError as exc:
+            return IngestResult(
+                status=IngestStatus.REJECTED,
+                event_id=result.event_id, source=result.source,
+                sequence=result.sequence,
+                reason=RejectReason.ARCHIVE_CAPACITY_EXCEEDED,
+                detail=(f"{exc}；本轮原始拒绝原因="
+                        f"{result.reason.value if result.reason else '?'}: "
+                        f"{result.detail}"))
 
     def _accept_or_reject(self, event: AuditEvent) -> IngestResult:
         """锁内判定：幂等重放 / 冲突 / 序号约束 / 容量背压 / 接收。"""
@@ -81,6 +112,18 @@ class AuditService:
                         f"（原来源 {existing.source}，原序号 {existing.sequence}），"
                         "按冲突拒绝"))
 
+        rejected = self._check_sequence_and_capacity(event)
+        if rejected is not None:
+            return rejected
+
+        self._commit(event)
+        return IngestResult(
+            status=IngestStatus.ACCEPTED,
+            event_id=event.event_id, source=event.source,
+            sequence=event.sequence)
+
+    def _check_sequence_and_capacity(self, event: AuditEvent) -> IngestResult | None:
+        """锁内检查来源内序号约束与容量背压；通过则返回 None。"""
         last_seq = self._last_sequence.get(event.source)
         if last_seq is not None:
             if event.sequence == last_seq:
@@ -110,12 +153,7 @@ class AuditService:
                     detail=(f"来源 {event.source} 在窗事件已达容量上限 "
                             f"{self.retention.max_events_per_source}，"
                             "请先执行保留策略再重试（背压）"))
-
-        self._commit(event)
-        return IngestResult(
-            status=IngestStatus.ACCEPTED,
-            event_id=event.event_id, source=event.source,
-            sequence=event.sequence)
+        return None
 
     def _commit(self, event: AuditEvent) -> None:
         """锁内落库：事件 + 完整性链追加 + 序号推进。"""
@@ -132,6 +170,86 @@ class AuditService:
         self.store.put_event(event)
         self.store.append_entry(event.source, entry)
         self._last_sequence[event.source] = event.sequence
+
+    # ---- 修复重投 ----
+    def repair_ingest(self, raw: dict,
+                      declared_source: str | None = None) -> IngestResult:
+        """修复通道：仅面向「曾被拒、且从未成功落库」的事件标识。
+
+        边界（与正常摄取完全一致的部分）：
+        - 已成功接收的标识：同内容 -> DUPLICATE（幂等重放）；
+          不同内容 -> REJECTED/DUPLICATE_EVENT_ID（冲突语义不被绕过）；
+        - 来源内序号约束、容量背压照常生效；
+        - 从未被拒过的标识不允许走修复通道（REPAIR_NOT_ALLOWED）。
+        """
+        event, rejection = self.validator.normalize_and_validate(raw, declared_source)
+        if rejection is not None:
+            reason, detail = rejection
+            result = IngestResult(
+                status=IngestStatus.REJECTED,
+                event_id=raw.get("event_id") if isinstance(raw, dict) else None,
+                source=raw.get("source") if isinstance(raw, dict) else None,
+                reason=reason, detail=detail)
+            return self._archive_rejection(result, raw, channel="repair")
+        assert event is not None
+        with self._ingest_lock:
+            result = self._repair_locked(event)
+        if result.status == IngestStatus.REJECTED and \
+                result.reason != RejectReason.REPAIR_NOT_ALLOWED:
+            result = self._archive_rejection(result, raw, channel="repair")
+        return result
+
+    def _repair_locked(self, event: AuditEvent) -> IngestResult:
+        existing = self.store.get_event(event.event_id)
+        if existing is not None:
+            # 已成功落库的标识：修复通道不绕过既有幂等/冲突语义
+            if existing == event:
+                return IngestResult(
+                    status=IngestStatus.DUPLICATE,
+                    event_id=event.event_id, source=event.source,
+                    sequence=event.sequence,
+                    existing_sequence=existing.sequence,
+                    detail="幂等重放：内容与已接收记录一致，未重复落库")
+            return IngestResult(
+                status=IngestStatus.REJECTED,
+                event_id=event.event_id, source=event.source,
+                sequence=event.sequence,
+                reason=RejectReason.DUPLICATE_EVENT_ID,
+                existing_sequence=existing.sequence,
+                detail=(f"事件标识 {event.event_id} 已成功接收过不同内容，"
+                        "修复通道不允许覆盖既有冲突语义"))
+
+        if not self.archive.has_rejection_for(event.event_id):
+            return IngestResult(
+                status=IngestStatus.REJECTED,
+                event_id=event.event_id, source=event.source,
+                sequence=event.sequence,
+                reason=RejectReason.REPAIR_NOT_ALLOWED,
+                detail=(f"事件标识 {event.event_id} 无在先被拒留档，"
+                        "不允许走修复通道，请使用正常摄取"))
+
+        rejected = self._check_sequence_and_capacity(event)
+        if rejected is not None:
+            return rejected
+
+        self._commit(event)
+        resolved = self.archive.mark_resolved(event.event_id)
+        return IngestResult(
+            status=IngestStatus.REPAIRED,
+            event_id=event.event_id, source=event.source,
+            sequence=event.sequence,
+            detail=(f"修复重投成功：事件标识 {event.event_id} 曾被拒 "
+                    f"{resolved} 次（留档保留可查），本次通过全部校验"))
+
+    # ---- 留档查询 ----
+    def query_rejections(self, source: str | None = None,
+                         reason: RejectReason | None = None,
+                         event_id: str | None = None) -> list[RejectionRecord]:
+        return self.archive.query(source=source, reason=reason,
+                                  event_id=event_id)
+
+    def rejection_archive_size(self) -> int:
+        return len(self.archive)
 
     # ---- 保留策略 ----
     def run_retention(self, now_ms: int | None = None) -> dict[str, int]:
@@ -175,7 +293,7 @@ class AuditService:
             events = self.store.get_events_by_source(source)
         else:
             events = [self.store.get_event(i) for i in
-                      sorted(self.store._events)]  # noqa: SLF001
+                      sorted(self.store._events)]
             events = [e for e in events if e is not None]
         evaluations = tuple(
             EventEvaluation(event_id=e.event_id,

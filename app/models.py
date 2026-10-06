@@ -20,12 +20,15 @@ class RejectReason(str, Enum):
     DUPLICATE_SEQUENCE = "duplicate_sequence"      # 同来源序号重复
     SEQUENCE_OUT_OF_ORDER = "sequence_out_of_order"  # 同来源序号倒退
     CAPACITY_EXCEEDED = "capacity_exceeded"        # 容量上限（背压，拒绝新事件）
+    ARCHIVE_CAPACITY_EXCEEDED = "archive_capacity_exceeded"  # 留档已满（背压）
+    REPAIR_NOT_ALLOWED = "repair_not_allowed"      # 修复通道不允许（无在先拒档）
 
 
 class IngestStatus(str, Enum):
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     DUPLICATE = "duplicate"   # 幂等重放：原已接收，非重复记录
+    REPAIRED = "repaired"     # 修复重投：曾被拒，本次通过全部校验并接收
 
 
 class ChainStatus(str, Enum):
@@ -82,6 +85,27 @@ class IngestResult:
     reason: RejectReason | None = None
     detail: str | None = None
     existing_sequence: int | None = None  # 幂等重放时指向原记录
+
+
+@dataclass(frozen=True)
+class RejectionRecord:
+    """一条被拒投递留档（不可变；重复投递同内容时整体替换为新版本）。
+
+    去重键：(event_id, source, content_hash)。同一去重键反复投递只更新
+    attempts / last_seen_ms，不产生新条目。
+    """
+
+    event_id: str | None
+    source: str | None
+    reason: RejectReason
+    detail: str
+    raw: dict[str, Any]          # 当时的原始投递内容
+    content_hash: str            # 规范化内容哈希（去重键的一部分）
+    channel: str                 # 产生留档的通道：ingest / repair
+    first_seen_ms: int
+    last_seen_ms: int
+    attempts: int = 1
+    resolved: bool = False       # 该事件标识后续是否已修复成功（留痕，不删除）
 
 
 @dataclass(frozen=True)

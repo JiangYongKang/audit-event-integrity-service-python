@@ -65,8 +65,8 @@ class EventValidator:
                           f"timestamp 必须是 Unix epoch 毫秒整数，实际为 {timestamp!r}")
         if timestamp < 0 or timestamp >= MAX_TIMESTAMP_MS:
             return None, (RejectReason.TIMESTAMP_OUT_OF_RANGE,
-                          f"timestamp={timestamp} 超出允许范围 "
-                          f"[0, {MAX_TIMESTAMP_MS})")
+                          (f"timestamp={timestamp} 超出允许范围 "
+                           f"[0, {MAX_TIMESTAMP_MS})"))
 
         if declared_source is not None and declared_source != source:
             return None, (RejectReason.SOURCE_MISMATCH,
