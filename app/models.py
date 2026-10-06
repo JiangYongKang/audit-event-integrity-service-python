@@ -20,12 +20,14 @@ class RejectReason(str, Enum):
     DUPLICATE_SEQUENCE = "duplicate_sequence"      # 同来源序号重复
     SEQUENCE_OUT_OF_ORDER = "sequence_out_of_order"  # 同来源序号倒退
     CAPACITY_EXCEEDED = "capacity_exceeded"        # 容量上限（背压，拒绝新事件）
+    ARCHIVE_CAPACITY_EXCEEDED = "archive_capacity_exceeded"  # 留档容量上限（背压）
 
 
 class IngestStatus(str, Enum):
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     DUPLICATE = "duplicate"   # 幂等重放：原已接收，非重复记录
+    REPAIRED = "repaired"     # 修复重投：此前被拒、本次修正后通过并被接收
 
 
 class ChainStatus(str, Enum):
@@ -82,6 +84,27 @@ class IngestResult:
     reason: RejectReason | None = None
     detail: str | None = None
     existing_sequence: int | None = None  # 幂等重放时指向原记录
+
+
+@dataclass(frozen=True)
+class RejectionRecord:
+    """被拒投递留档（合规留痕，不参与完整性链）。
+
+    以 (source, event_id) 去重：同一份内容被反复投递时只更新
+    attempts/last_seen_ms，不产生新条目。修复成功后保留记录并置
+    resolved=True，当初的拒绝原因与原始内容仍可查。
+    """
+
+    source: str
+    event_id: str
+    reason: RejectReason
+    detail: str | None
+    raw_payload: dict[str, Any]   # 当时投递的原始内容（最近一次）
+    first_seen_ms: int
+    last_seen_ms: int
+    attempts: int = 1
+    resolved: bool = False        # 修复重投成功后置 True，记录仍保留
+    resolved_at_ms: int | None = None
 
 
 @dataclass(frozen=True)

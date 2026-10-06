@@ -31,7 +31,7 @@ class IntegrityChain:
     def derive_entry_hash(prev_entry_hash: str | None, event_hash: str,
                           sequence: int) -> str:
         prev = prev_entry_hash if prev_entry_hash is not None else GENESIS
-        body = f"{prev}|{event_hash}|{sequence}".encode("utf-8")
+        body = f"{prev}|{event_hash}|{sequence}".encode()
         return _sha256_hex(body)
 
     def verify(self, source: str, events: list[AuditEvent | None],

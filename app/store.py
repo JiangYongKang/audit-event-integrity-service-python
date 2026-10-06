@@ -21,6 +21,8 @@ class _SourceState:
     checkpoint_tail: str | None = None
     # 已淘汰的事件数量（用于容量统计与可解释性）
     evicted_count: int = 0
+    # 已接收的最大序号（淘汰不清零）：来源内序号严格递增的判定基准
+    last_sequence: int | None = None
 
 
 class EventStore:
@@ -46,6 +48,7 @@ class EventStore:
         state = self._state(source)
         state.chain.append(entry)
         state.anchors.append(entry.entry_hash)
+        state.last_sequence = entry.sequence
 
     def truncate_prefix(self, source: str, count: int,
                         new_tail: str | None) -> None:
@@ -81,6 +84,9 @@ class EventStore:
 
     def get_evicted_count(self, source: str) -> int:
         return self._state(source).evicted_count
+
+    def get_last_sequence(self, source: str) -> int | None:
+        return self._state(source).last_sequence
 
     def count_for_source(self, source: str) -> int:
         return len(self._state(source).chain)
